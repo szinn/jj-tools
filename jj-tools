@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+#
+# @meta version 0.1.0
+# @meta require-tools jj,gh,gum,jq
+# @meta combine-shorts
+#
+# @flag -d --debug Turn on debug logging.
+# @flag -D --shellx Turn on shell command debugging.
+# @option -c --config=$HOME/.config/jj-tools/config.json <CONFIG> Path to config file.
+#
+# @describe
+#
+# jj-tools is a command-line tool that provides extra functionality to Jujutsu (jj)
+# version control.
+
+set -euo pipefail
+
+# argc is required to run this script
+if ! command -v argc &>/dev/null; then
+  echo "Error: Required dependency 'argc' is not installed or not in PATH." >&2
+  exit 1
+fi
+
+# @cmd Fetch latest changes from remote and rebase local trunk commits.
+# @alias f
+#
+# @describe
+#
+# Fetch performs a git fetch and then automatically rebases local commits
+# that are children of the project's configured rebase branch onto the fetched
+# destination. By default, the root bookmark is trunk(), but can be customized
+# per-project by the root_bookmark config setting. This keeps your feature
+# branches up-to-date with the main project root branch and correctly rebased
+# after an update from the remote.
+#
+fetch() {
+  local root_bookmark root_change_id heads filter root_children
+
+  [[ -n "${argc_shellx:-}" ]] && set -x
+
+  assert_jj_repo
+
+  pushd "$(jj root)" >/dev/null
+
+  root_bookmark="$(fetch_root_bookmark "$PWD")"
+  root_change_id="$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()' -r "$root_bookmark")"
+
+  debug "root_bookmark: $root_bookmark ($root_change_id)"
+
+  jj git fetch
+  debug "jj git fetch complete"
+
+  heads="$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short() ++ " "' -r 'heads(all())')"
+  debug "heads: $heads"
+
+  filter=""
+  for change in $heads; do
+    if ! [[ "$filter" == "" ]]; then
+      filter="$filter & "
+    fi
+    filter="$filter$root_change_id-::$change"
+  done
+  debug "filter: $filter"
+
+  IFS=' ' read -r root_children <<<"$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()++" "' -r "mine() & children(latest($filter))")"
+  debug "root_children: $root_children"
+  if [[ $root_children == "" ]]; then
+    gum log info "No work to do"
+    return
+  fi
+
+  for child in $root_children; do
+    local immutable empty
+    debug "Processing change: $child"
+
+    immutable="$(jj log --ignore-working-copy --no-graph --color never -T 'immutable' -r "$child" 2>/dev/null)"
+    debug "  $child: immutable=$immutable"
+    if [[ "$immutable" == "false" ]]; then
+      debug "  rebasing $child"
+      jj rebase --quiet -s "$child" -d "$root_bookmark"
+      empty="$(jj log --ignore-working-copy --no-graph --color never -T 'empty' -r "$child")"
+      if [[ "$empty" == "true" ]]; then
+        jj abandon "$child"
+      fi
+    fi
+  done
+
+  popd >/dev/null
+}
+
+# @cmd Create and update GitHub pull requests from Jujutsu commits.
+# @alias pr
+#
+# @option -r --revset=@ <REVSET> The revset to commit.
+#
+# @describe
+#
+# Create or update a GitHub pull request based on a the latest
+# parent commit with a bookmark.
+#
+# The first line of the commit description becomes the PR title
+# and the remaining lines form the body of the PR.
+#
+pull-request() {
+  [[ -n "${argc_shellx:-}" ]] && set -x
+
+  local revset
+  revset="$argc_revset"
+
+  debug "Creating / updating PR for revset=$revset"
+  assert_jj_repo
+  assert_non_empty_commit "$revset"
+  assert_gh_is_logged_in
+
+  pushd "$(jj root)" >/dev/null
+
+  echo -e 'commit description:\n'
+  get_description "$revset" | gum format
+  echo
+  if confirm 'edit description?' --default=No; then
+    jj desc -r "$revset"
+    echo
+  fi
+
+  create_or_update_pull_request "$revset"
+
+  popd >/dev/null
+}
+
+# Creates a new pull request or updates the existing one for the current
+# bookmark.
+create_or_update_pull_request() {
+  local bookmark parent pr revset
+
+  revset="$1"
+  debug "Creating / updating PR for revset=$revset"
+  assert_gh_is_logged_in
+  assert_non_empty_description "$revset"
+
+  # Bookmark is fetched before push so that new/existing bookmark state can be
+  # determined sinse 'jj git push' will create a new bookmark.
+  bookmark="$(get_bookmark "$revset")"
+  debug "Bookmark is $bookmark"
+
+  # Before pull request can be created a commit must be pushed to github.
+  gum spin --title='pushing bookmark' -- jj git push -c "$revset" --quiet
+  echo
+
+  parent="$(get_parent "$revset")"
+  debug "Parent is $parent"
+  pr="$(gh pr list -H "$bookmark" --json number | jq -r '.[0].number')"
+  if [[ "$pr" == 'null' ]]; then
+    if confirm 'create pr?'; then
+      gum log -l info "creating new pull request with parent $parent"
+      echo
+      gh pr create \
+        --base "$parent" \
+        --head "$bookmark" \
+        --title "$(get_description "$revset" | head -n 1)" \
+        --body-file - < <(get_description "$revset" | tail -n +3) || exit 1
+      echo
+    fi
+  elif confirm 'update pr?' --default=Yes; then
+    gum log -l info "updating pull request $pr for branch $bookmark"
+    echo
+    gh pr edit "$pr" \
+      --base "$parent" \
+      --title "$(get_description "$revset" | head -n 1)" \
+      --body-file - < <(get_description "$revset" | tail -n +3)
+    echo
+  fi
+}
+
+# Checks that the current directory is a jj repository; exits with error if not.
+assert_jj_repo() {
+  if ! jj root &>/dev/null; then
+    gum log -l error 'must be used inside jj repo'
+    exit 1
+  fi
+}
+
+# Checks that GitHub CLI is authorized; exits with error if not.
+assert_gh_is_logged_in() {
+  if ! gh auth status &>/dev/null; then
+    gum log -l error 'gh is not authorized, run "gh auth login"'
+    exit 1
+  fi
+}
+
+# Checks that commit description has at least 3 lines; exits with error if not.
+assert_non_empty_description() {
+  if (($(get_description "$1" | wc -l) < 3)); then
+    gum log -l error 'description must have at lest 3 lines'
+    exit 1
+  fi
+}
+
+# Checks that current commit has changes; exits when commit is empty.
+assert_non_empty_commit() {
+  if [[ "$(jj log -r @ --no-graph -T empty -r "$1")" == 'true' ]]; then
+    gum log -l error 'commit is empty'
+    exit 1
+  fi
+}
+
+# Returns the commit description of the current (working) commit.
+get_description() {
+  jj log --ignore-working-copy --no-graph -T description -r "$1"
+}
+
+# Retrieves the current bookmark for the working commit. If none exists,
+# creates a new bookmark using the template from jj config and returns its name.
+get_bookmark() {
+  local revset bookmark
+
+  revset="$1"
+  bookmark="$(jj log --color never --no-graph -T bookmarks --limit 1 -r "($revset::) & bookmarks()" | sed -e 's/\*//')"
+  if [[ -z "$bookmark" ]]; then
+    local template
+
+    template="$(jj config get templates.git_push_bookmark)"
+    bookmark="$(jj log --color never --no-graph -T "$template" -r "$revset")"
+    gum log -l info "creating new bookmark $bookmark"
+    jj bookmark create --ignore-working-copy "$bookmark" -r "$revset" --quiet
+  else
+    gum log -l info "using existing bookmark $bookmark"
+  fi
+  echo "$bookmark"
+}
+
+# Returns the name of the most recent ancestor commit with a bookmark.
+# The "green" bookmark represents a clean-buildable state used for development.
+# When found as a parent, "trunk" is returned instead since all code merges to trunk.
+get_parent() {
+  local revset parent
+
+  revset="$1"
+
+  parent="$(jj log \
+    --ignore-working-copy \
+    --color never \
+    --no-graph \
+    --limit 1 \
+    -T bookmarks \
+    -r "latest(ancestors(\"$revset\"-) & bookmarks())" | sed -e 's/\*$//')"
+  gum log -l debug "Parent is $parent"
+  if [[ "$parent" =~ green ]]; then
+    echo 'main'
+  else
+    echo "$parent"
+  fi
+}
+
+# Retrieve the root bookmark for the given project.
+fetch_root_bookmark() {
+  local pwd destination
+
+  pwd="${1/#$HOME/\$HOME}"
+  destination="$(cat "$(config_path)" | jq -r --arg pwd "$pwd" '
+    # First try to get project-specific destination
+    if .project_settings[$pwd].root_bookmark then
+      .project_settings[$pwd].root_bookmark
+    # Fall back to top-level root_bookmark
+    elif .root_bookmark then
+      .root_bookmark
+    else
+      "trunk()"
+    end')"
+  echo "$destination"
+}
+
+# Prompt the user for confirmation using gum.
+# Returns 0 for yes, 1 for no, and exits with 130 on interrupt (Ctrl-C).
+confirm() {
+  gum confirm "$@"
+  case $? in
+  0)
+    return 0
+    ;;
+  1)
+    return 1
+    ;;
+  130)
+    exit 130
+    ;;
+  esac
+}
+
+# Determine the path to the config file.
+config_path() {
+  local path
+
+  path="${argc_config/\$HOME/$HOME}"
+  if [[ ! -f "$path" ]]; then
+    echo "Config file '$path' is not found" >&2
+    exit 1
+  fi
+  echo "$path"
+}
+
+# Display debug message
+debug() {
+  [[ -n "${argc_debug:-}" ]] && gum log -l debug "$@"
+}
+
+eval "$(argc --argc-eval "$0" "$@")"
