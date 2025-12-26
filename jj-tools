@@ -13,7 +13,7 @@
 # jj-tools is a command-line tool that provides extra functionality to Jujutsu (jj)
 # version control.
 
-set -euo pipefail
+set -uo pipefail
 
 # argc is required to run this script
 if ! command -v argc &>/dev/null; then
@@ -34,7 +34,7 @@ fi
 # after an update from the remote.
 #
 fetch() {
-  local root_bookmark root_change_id heads filter root_children
+  local root_bookmark root_change_id
 
   [[ -n "${argc_shellx:-}" ]] && set -x
 
@@ -50,24 +50,16 @@ fetch() {
   jj git fetch
   debug "jj git fetch complete"
 
-  heads="$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short() ++ " "' -r 'heads(all())')"
-  debug "heads: $heads"
-
-  filter=""
-  for change in $heads; do
-    if ! [[ "$filter" == "" ]]; then
-      filter="$filter & "
-    fi
-    filter="$filter$root_change_id-::$change"
-  done
-  debug "filter: $filter"
-
-  IFS=' ' read -r root_children <<<"$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()++" "' -r "mine() & children(latest($filter))")"
-  debug "root_children: $root_children"
-  if [[ $root_children == "" ]]; then
+  local new_root_change_id
+  new_root_change_id="$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()' -r "$root_bookmark")"
+  if [[ "$new_root_change_id" == "$root_change_id" ]]; then
     gum log info "No work to do"
     return
   fi
+
+  local root_children
+  IFS=' ' read -r root_children <<<"$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()++" "' -r "children($root_change_id) & mine() & mutable()")"
+  debug "root_children: $root_children"
 
   for child in $root_children; do
     local immutable empty
@@ -78,14 +70,42 @@ fetch() {
     if [[ "$immutable" == "false" ]]; then
       debug "  rebasing $child"
       jj rebase --quiet -s "$child" -d "$root_bookmark"
-      empty="$(jj log --ignore-working-copy --no-graph --color never -T 'empty' -r "$child")"
-      if [[ "$empty" == "true" ]]; then
-        jj abandon "$child"
-      fi
     fi
   done
+  remove-empty-changes "$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()++" "' -r "$root_bookmark" 2>/dev/null)"
 
   popd >/dev/null
+}
+
+remove-empty-changes() {
+  local root
+  root=$1
+  local processed=()
+
+  local current_change
+  current_change="$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()' -r @)"
+  processed+=("$current_change")
+
+  local work_done="Y"
+  while [[ "$work_done" == "Y" ]]; do
+    work_done="N"
+
+    local children
+    IFS=' ' read -r children <<<"$(jj log --ignore-working-copy --no-graph --color never -T 'change_id.short()++" "' -r "children($root)")"
+    for child in $children; do
+      if [[ " ${processed[*]} " =~ [[:space:]]${child}[[:space:]] ]]; then
+        continue
+      fi
+      processed+=("$child")
+      local empty
+      empty="$(jj log --ignore-working-copy --no-graph --color never -T 'empty' -r "$child")"
+      if [[ "$empty" == "true" ]]; then
+        debug "  Removing $child"
+        jj abandon "$child"
+        work_done="Y"
+      fi
+    done
+  done
 }
 
 # @cmd Create and update GitHub pull requests from Jujutsu commits.
