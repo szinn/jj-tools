@@ -132,7 +132,7 @@ pull-request() {
   assert_non_empty_commit "$revset"
   assert_gh_is_logged_in
 
-  pushd "$(jj root)" >/dev/null
+  pushd "$(jj root)" >/dev/null || exit
 
   echo -e 'commit description:\n'
   get_description "$revset" | gum format
@@ -144,7 +144,7 @@ pull-request() {
 
   create_or_update_pull_request "$revset"
 
-  popd >/dev/null
+  popd >/dev/null || exit
 }
 
 # Creates a new pull request or updates the existing one for the current
@@ -189,6 +189,21 @@ create_or_update_pull_request() {
       --body-file - < <(get_description "$revset" | tail -n +3)
     echo
   fi
+}
+
+# @cmd Sync/push local PR bookmarks to the remote.
+#
+# Sync/push local bookmarks crated with the PR command
+# to the remote repository.
+#
+sync() {
+  [[ -n "${argc_shellx:-}" ]] && set -x
+
+  pushd "$(jj root)" >/dev/null || exit
+
+  jj git push -r "bookmarks() & mutable()"
+
+  popd >/dev/null || exit
 }
 
 # Checks that the current directory is a jj repository; exits with error if not.
